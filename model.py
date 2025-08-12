@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torchvision import datasets, transforms
+from torchvision.utils import make_grid, save_image
 
 # ---- Noise ----
 def add_noise(img, noise_factor=0.3):
@@ -43,7 +44,7 @@ model = DenoisingAutoencoder().to(device)
 criterion = nn.MSELoss()
 optimizer = optim.Adam(model.parameters(), lr=1e-3)
 noise_factor = 0.3
-epochs = 10  # change as you like
+epochs = 10  
 
 def evaluate(loader):
     model.eval()
@@ -82,3 +83,39 @@ for epoch in range(epochs):
     train_avg = train_total / train_count
     test_avg  = evaluate(test_loader)
     print(f"Epoch {epoch+1:02d} | train_MSE={train_avg:.4f} | test_MSE={test_avg:.4f}")
+    # ---- Iterative denoising experiment (no backprop) ----
+model.eval()
+steps = 5           # number of times to re-feed the output
+num_show = 8        # how many images to visualize in a grid
+
+@torch.no_grad()
+def batch_mse(a, b):
+    return ((a - b) ** 2).mean().item()
+
+with torch.no_grad():
+    # take one test batch
+    imgs, _ = next(iter(test_loader))
+    imgs = imgs.to(device)[:num_show]
+    noisy = add_noise(imgs, noise_factor)
+
+    x = noisy.clone()
+    mses = []
+
+    # measure baseline MSEs
+    mse_noisy_vs_clean = batch_mse(noisy, imgs)
+    print(f"Baseline (noisy vs clean) MSE ≈ {mse_noisy_vs_clean:.4f}")
+
+    grids = [imgs.cpu(), noisy.cpu()]  # for visualization: clean | noisy | step1 | step2 | ...
+
+    # iterative passes
+    for s in range(1, steps + 1):
+        x = model(x)  # feed output back in
+        mse_step = batch_mse(x, imgs)
+        mses.append(mse_step)
+        print(f"Iter {s}: MSE(recon_vs_clean) = {mse_step:.4f}")
+        grids.append(x.cpu())
+
+    # save a visualization grid
+    grid = make_grid(torch.cat(grids, dim=0), nrow=num_show, pad_value=1.0)
+    save_image(grid, "iterative_denoise_grid.png")
+    print("Saved grid to iterative_denoise_grid.png")
