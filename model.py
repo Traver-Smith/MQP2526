@@ -5,7 +5,7 @@ from torchvision import datasets, transforms
 from torchvision.utils import make_grid, save_image
 
 # ---- Noise ----
-def add_noise(img, noise_factor=0.3):
+def add_noise(img, noise_factor=0.81):
     noisy = img + noise_factor * torch.randn_like(img)
     return torch.clamp(noisy, 0., 1.)
 
@@ -72,7 +72,7 @@ for epoch in range(epochs):
         #for i in range(np.rand(1, 5)):
 
             #output=model(output)
-        outputs =model(model(noisy_imgs))
+        outputs =model(model(model(noisy_imgs)))
         loss = criterion(outputs, imgs)
 
         optimizer.zero_grad()
@@ -88,7 +88,7 @@ for epoch in range(epochs):
     print(f"Epoch {epoch+1:02d} | train_MSE={train_avg:.4f} | test_MSE={test_avg:.4f}")
 # ---- Iterative denoising experiment (no backprop) ----
 model.eval()
-steps = 2000           # number of times to re-feed the output
+steps = 50           # number of times to re-feed the output
 num_show = 8        # how many images to visualize in a grid
 
 @torch.no_grad()
@@ -112,7 +112,7 @@ with torch.no_grad():
 
     # iterative passes
     for s in range(1, steps + 1):
-        x = model(model(model(x)))  # feed output back in
+        x = model(x)  # feed output back in
         mse_step = batch_mse(x, imgs)
         mses.append(mse_step)
         print(f"Iter {s}: MSE(recon_vs_clean) = {mse_step:.4f}")
