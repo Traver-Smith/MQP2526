@@ -68,8 +68,11 @@ for epoch in range(epochs):
     for imgs, _ in train_loader:
         imgs = imgs.to(device)
         noisy_imgs = add_noise(imgs, noise_factor)
+        #utput = noisy_imgs
+        #for i in range(np.rand(1, 5)):
 
-        outputs = model(noisy_imgs)
+            #output=model(output)
+        outputs =model(model(noisy_imgs))
         loss = criterion(outputs, imgs)
 
         optimizer.zero_grad()
@@ -83,9 +86,9 @@ for epoch in range(epochs):
     train_avg = train_total / train_count
     test_avg  = evaluate(test_loader)
     print(f"Epoch {epoch+1:02d} | train_MSE={train_avg:.4f} | test_MSE={test_avg:.4f}")
-    # ---- Iterative denoising experiment (no backprop) ----
+# ---- Iterative denoising experiment (no backprop) ----
 model.eval()
-steps = 5           # number of times to re-feed the output
+steps = 2000           # number of times to re-feed the output
 num_show = 8        # how many images to visualize in a grid
 
 @torch.no_grad()
@@ -109,7 +112,7 @@ with torch.no_grad():
 
     # iterative passes
     for s in range(1, steps + 1):
-        x = model(x)  # feed output back in
+        x = model(model(model(x)))  # feed output back in
         mse_step = batch_mse(x, imgs)
         mses.append(mse_step)
         print(f"Iter {s}: MSE(recon_vs_clean) = {mse_step:.4f}")
