@@ -1,23 +1,11 @@
 import torch
 import torch.nn as nn
-import torch.optim as optim
 from torchvision import datasets, transforms
-from torchvision.utils import make_grid, save_image
-import numpy as np
-import matplotlib.pyplot as plt
-from torchvision.utils import make_grid
-from typing import Dict, List
-
-# ----------------------------
-# Noise
-# ----------------------------
-def add_noise(img, noise_factor=0.81):
-    """
-    Add Gaussian noise to an input image tensor in [0,1], then clamp.
-    """
-    noisy = img + noise_factor * torch.randn_like(img)
-    return torch.clamp(noisy, 0., 1.)
-
+from .DenoisingAutoencoder import DAE
+from .performance import evaluate, plot_loss_curves, plot_refeed_curves
+from .data_processing import add_noise
+from .stacking_utils import  stacked_dae_loss
+import random
 # ----------------------------
 # Data
 # ----------------------------
@@ -27,69 +15,12 @@ test_data  = datasets.MNIST(root='./data', train=False, transform=transform, dow
 train_loader = torch.utils.data.DataLoader(train_data, batch_size=128, shuffle=True, num_workers=0, pin_memory=True)
 test_loader  = torch.utils.data.DataLoader(test_data,  batch_size=256, shuffle=False, num_workers=0, pin_memory=True)
 
-# ----------------------------
-# Model
-# ----------------------------
-class DenoisingAutoencoder(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(784, 512), nn.ReLU(),
-            nn.Linear(512, 128), nn.ReLU(),
-            nn.Linear(128, 64)
-        )
-        self.decoder = nn.Sequential(
-            nn.Linear(64, 128), nn.ReLU(),
-            nn.Linear(128, 512), nn.ReLU(),
-            nn.Linear(512, 784), nn.Sigmoid(),
-            nn.Unflatten(1, (1, 28, 28))
-        )
-    def forward(self, x):
-        z = self.encoder(x)
-        return self.decoder(z)
 
-# ----------------------------
-# Utilities
-# ----------------------------
-def forward_k(model: nn.Module, x: torch.Tensor, k: int) -> torch.Tensor:
-    """
-    Feed 'x' through 'model' k times (re-feeds).
-    """
-    for _ in range(k):
-        x = model(x)
-    return x
-
-@torch.no_grad()
-def batch_mse(a, b):
-    return ((a - b) ** 2).mean().item()
-
-def evaluate(model: nn.Module,
-             loader,
-             *,
-             denoising: bool,
-             re_feeds: int = 1,
-             noise_factor: float = 0.81,
-             device: torch.device = torch.device("cpu"),
-             criterion = nn.MSELoss()) -> float:
-    """
-    Evaluate reconstruction MSE against the clean target images.
-    - If denoising=True, inputs = add_noise(clean), targets = clean.
-    - If denoising=False, inputs = clean, targets = clean.
-    - The model output is forward_k(model, inputs, re_feeds).
-    """
-    model.eval()
-    total, count = 0.0, 0
-    with torch.no_grad():
-        for imgs, _ in loader:
-            imgs = imgs.to(device, non_blocking=True)
-            inputs = add_noise(imgs, noise_factor) if denoising else imgs
-            recon = forward_k(model, inputs, re_feeds)
-            loss = criterion(recon, imgs)
-            bsz = imgs.size(0)
-            total += loss.item() * bsz
-            count += bsz
-    return total / max(count, 1)
+history = {
+    "AE": {"train": [], "val": []},
+    "DAE": {"train": [], "val": []},
+    "sDAE": {"train": [], "val_final": [], "val_multi": []}
+}
 
 # ----------------------------
 # Setup 3 models
@@ -97,142 +28,146 @@ def evaluate(model: nn.Module,
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 1) Stacked denoising AE (SDAE): trained with k>1 re-feeds on noisy inputs
-sdae = DenoisingAutoencoder().to(device)
+sdae = DAE().to(device)
 
 # 2) Single-pass denoising AE (DAE): trained 1 pass on noisy inputs
-dae  = DenoisingAutoencoder().to(device)
+dae  = DAE().to(device)
 
 # 3) Plain AE: trained 1 pass on clean inputs
-ae   = DenoisingAutoencoder().to(device)
+ae   = DAE().to(device)
 
+num_epochs = 20
+lr = 1e-3
 criterion = nn.MSELoss()
-opt_sdae = optim.Adam(sdae.parameters(), lr=1e-3)
-opt_dae  = optim.Adam(dae.parameters(),  lr=1e-3)
-opt_ae   = optim.Adam(ae.parameters(),   lr=1e-3)
-
-noise_factor = 0.81
-epochs = 10
-stack_k_train = 3     # SDAE training re-feeds
-stack_k_eval  = 3     # SDAE default eval re-feeds
+opt_ae   = torch.optim.Adam(ae.parameters(), lr=lr)
+opt_dae  = torch.optim.Adam(dae.parameters(), lr=lr)
+opt_sdae = torch.optim.Adam(sdae.parameters(), lr=lr)
 
 # ----------------------------
 # Training loop
 # ----------------------------
-for epoch in range(1, epochs + 1):
-    sdae.train(); dae.train(); ae.train()
-    train_sum = {"sdae":0.0, "dae":0.0, "ae":0.0}
-    train_cnt = 0
+for epoch in range(1, num_epochs + 1):
+    ae.train()
+    total_loss, count = 0.0, 0
 
     for imgs, _ in train_loader:
         imgs = imgs.to(device, non_blocking=True)
-        noisy = add_noise(imgs, noise_factor)
+        opt_ae.zero_grad()
 
-        bsz = imgs.size(0)
+        #Forward pass (clean -> clean, 1 feed)
+        recon = ae(imgs)
+        loss = criterion(recon, imgs)
 
-        # ---- SDAE: noisy -> clean with k re-feeds
-        x = forward_k(sdae, noisy, stack_k_train)
-        loss_sdae = criterion(x, imgs)
-        opt_sdae.zero_grad(set_to_none=True)
-        loss_sdae.backward()
-        opt_sdae.step()
-
-        # ---- DAE: noisy -> clean with 1 pass
-        out_dae = dae(noisy)
-        loss_dae = criterion(out_dae, imgs)
-        opt_dae.zero_grad(set_to_none=True)
-        loss_dae.backward()
-        opt_dae.step()
-
-        # ---- AE: clean -> clean with 1 pass
-        out_ae = ae(imgs)
-        loss_ae = criterion(out_ae, imgs)
-        opt_ae.zero_grad(set_to_none=True)
-        loss_ae.backward()
+        #Backwards + update
+        loss.backward()
         opt_ae.step()
 
-        train_sum["sdae"] += loss_sdae.item() * bsz
-        train_sum["dae"]  += loss_dae.item()  * bsz
-        train_sum["ae"]   += loss_ae.item()   * bsz
-        train_cnt         += bsz
+        # Accumulate training loss
+        bsz = imgs.size(0)
+        total_loss += loss.item() * bsz
+        count += bsz
+    
+    #Average training loss
+    train_loss = total_loss / max(count, 1)
 
-    # ---- Eval in natural regimes
-    sdae_test = evaluate(sdae, test_loader, denoising=True,  re_feeds=stack_k_eval, noise_factor=noise_factor, device=device, criterion=criterion)
-    dae_test  = evaluate(dae,  test_loader, denoising=True,  re_feeds=1,               noise_factor=noise_factor, device=device, criterion=criterion)
-    ae_test   = evaluate(ae,   test_loader, denoising=False, re_feeds=1,               noise_factor=noise_factor, device=device, criterion=criterion)
+    #Evaluate on test set (clean -> clean)
+    val_loss = evaluate(ae, test_loader, device=device, criterion=criterion)
+    history["AE"]["train"].append(train_loss)
+    history["AE"]["val"].append(val_loss)
 
-    print(
-        f"Epoch {epoch:02d} | "
-        f"SDAE train_MSE={train_sum['sdae']/train_cnt:.4f} test_MSE={sdae_test:.4f} (k_train={stack_k_train}, k_eval={stack_k_eval}) | "
-        f"DAE  train_MSE={train_sum['dae']/train_cnt:.4f}  test_MSE={dae_test:.4f} | "
-        f"AE   train_MSE={train_sum['ae']/train_cnt:.4f}   test_MSE={ae_test:.4f}"
-    )
+    print(f"Epoch [{epoch:03d}/{num_epochs}] "
+          f"Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
 
-# ----------------------------
-# Iterative re-feed sweep for SDAE (k=1..100), with baselines
-# ----------------------------
-sdae.eval(); dae.eval(); ae.eval()
+# -------------------------------------
+# Non-stacked DAE Training Loop
+# --------------------------------------
 
-@torch.no_grad()
-def sdae_k_sweep_mse(model: nn.Module,
-                     loader,
-                     ks: List[int],
-                     noise_factor: float,
-                     device: torch.device,
-                     criterion = nn.MSELoss()) -> Dict[int, float]:
-    """
-    Compute test MSE for each k re-feeds on the *same* test set, denoising mode.
-    Returns dict {k: mse}.
-    """
-    results = {}
-    for k in ks:
-        mse_k = evaluate(model, loader, denoising=True, re_feeds=k,
-                         noise_factor=noise_factor, device=device, criterion=criterion)
-        results[k] = mse_k
-    return results
+for epoch in range(1, num_epochs + 1):
+    dae.train()
+    total_loss, count = 0.0, 0
 
-# Baseline reference (single numbers)
-dae_mse  = evaluate(dae, test_loader, denoising=True,  re_feeds=1, noise_factor=noise_factor, device=device, criterion=criterion)
-ae_mse   = evaluate(ae,  test_loader, denoising=False, re_feeds=1, noise_factor=noise_factor, device=device, criterion=criterion)
+    for imgs, _ in train_loader:
+        imgs = imgs.to(device, non_blocking=True)
+        noisy_imgs = add_noise(imgs, noise_factor=0.81)
 
-ks = list(range(1, 101))
-sdae_curve = sdae_k_sweep_mse(sdae, test_loader, ks, noise_factor, device, criterion)
+        opt_dae.zero_grad()
+        recon = dae(noisy_imgs)
+        loss = criterion(recon, imgs)
+        loss.backward()
+        opt_dae.step()
 
-# ----------------------------
-# Plot
-# ----------------------------
-plt.figure(figsize=(9, 4.5))
-plt.plot(ks, [sdae_curve[k] for k in ks], marker='o', linestyle='-', label='SDAE (k re-feeds)')
-plt.axhline(dae_mse, color='gray', linestyle='--', label=f'DAE (1 pass): {dae_mse:.4f}')
-plt.axhline(ae_mse,  color='black', linestyle=':',  label=f'AE (clean→clean): {ae_mse:.4f}')
-plt.xlabel('Number of Re-feeds (k)')
-plt.ylabel('Test Reconstruction MSE vs. Clean')
-plt.title('SDAE Re-feed Depth vs. Test MSE (MNIST)')
-plt.legend()
-plt.grid(True, alpha=0.3)
-plt.tight_layout()
-plt.show()
+        bsz = imgs.size(0)
+        total_loss += loss.item() * bsz
+        count += bsz
 
-# ----------------------------
-# Optional: quick sample visualization of denoising
-# ----------------------------
-@torch.no_grad()
-def visualize_examples(model_sdae, model_dae, model_ae, loader, k_sdae=3, noise_factor=0.81, num_show=8):
-    imgs, _ = next(iter(loader))
-    imgs = imgs[:num_show].to(device)
-    noisy = add_noise(imgs, noise_factor)
+    train_loss = total_loss / max(count, 1)
 
-    deno_sdae = forward_k(model_sdae, noisy, k_sdae)
-    deno_dae  = model_dae(noisy)
-    recon_ae  = model_ae(imgs)
+    # use general evaluate (denoising=True, re_feeds=1, stacked=False)
+    val_loss = evaluate(dae, test_loader,
+                        denoising=True,
+                        re_feeds=1,
+                        stacked=False,
+                        device=device,
+                        criterion=criterion)
+    history["DAE"]["train"].append(train_loss)
+    history["DAE"]["val"].append(val_loss)
 
-    # grid: clean | noisy | SDAE | DAE | AE (for reference)
-    grid = torch.cat([imgs.cpu(), noisy.cpu(), deno_sdae.cpu(), deno_dae.cpu(), recon_ae.cpu()], dim=0)
-    grid = make_grid(grid, nrow=num_show, pad_value=1.0)
-    plt.figure(figsize=(num_show * 1.2, 6))
-    plt.imshow(grid.permute(1, 2, 0))
-    plt.axis("off")
-    plt.title(f"SDAE k={k_sdae} | DAE 1-pass | AE 1-pass")
-    plt.show()
+    print(f"[DAE] Epoch [{epoch:03d}/{num_epochs}] "
+          f"Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
 
-# Uncomment to visualize
-# visualize_examples(sdae, dae, ae, test_loader, k_sdae=stack_k_eval, noise_factor=noise_factor, num_show=8)
+# -------------------------------------
+# Stacked DAE Training Loop
+# --------------------------------------
+k_max = 5
+for epoch in range(1, num_epochs + 1):
+    sdae.train()
+    total_final_loss, count = 0.0, 0
+
+    for imgs, _ in train_loader:
+        imgs = imgs.to(device, non_blocking=True)
+        noisy_imgs = add_noise(imgs, noise_factor=0.81)
+
+        k_refeeds = random.randint(1, k_max)
+
+        opt_sdae.zero_grad()
+        loss, final_out = stacked_dae_loss(sdae, noisy_imgs, imgs, k=k_refeeds)
+        loss.backward()
+        opt_sdae.step()
+
+        # log *final-pass* train loss for comparability
+        final_loss = torch.mean((final_out - imgs) ** 2).item()
+        bsz = imgs.size(0)
+        total_final_loss += final_loss * bsz
+        count += bsz
+
+    train_loss_final = total_final_loss / max(count, 1)
+
+    # Validation: log both final and multi-step
+    val_loss_final = evaluate(sdae, test_loader,
+                              denoising=True,
+                              re_feeds=k_max,
+                              stacked=True,
+                              multi_step=False,
+                              device=device,
+                              criterion=criterion)
+
+    val_loss_multi = evaluate(sdae, test_loader,
+                              denoising=True,
+                              re_feeds=k_max,
+                              stacked=True,
+                              multi_step=True,
+                              device=device,
+                              criterion=criterion)
+
+    history["sDAE"]["train"].append(train_loss_final)   # comparable to AE/DAE
+    history["sDAE"]["val_final"].append(val_loss_final) # comparable metric
+    history["sDAE"]["val_multi"].append(val_loss_multi) # diagnostic
+
+    print(f"[Stacked DAE] Epoch [{epoch:03d}/{num_epochs}] "
+          f"Train Final: {train_loss_final:.6f} | "
+          f"Val Final: {val_loss_final:.6f} | Val Multi: {val_loss_multi:.6f}")
+
+plot_loss_curves(history, num_epochs, show_sdae_multi=True)
+
+models = {"AE": ae, "DAE": dae, "sDAE": sdae}
+plot_refeed_curves(models, test_loader, device, max_refeeds=150)
