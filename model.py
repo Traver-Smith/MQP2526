@@ -15,7 +15,7 @@ test_data  = datasets.MNIST(root='./data', train=False, transform=transform, dow
 train_loader = torch.utils.data.DataLoader(train_data, batch_size=128, shuffle=True, num_workers=0, pin_memory=True)
 test_loader  = torch.utils.data.DataLoader(test_data,  batch_size=256, shuffle=False, num_workers=0, pin_memory=True)
 
-
+print('loading')
 history = {
     "AE": {"train": [], "val": []},
     "DAE": {"train": [], "val": []},
