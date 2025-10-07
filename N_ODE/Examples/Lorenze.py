@@ -7,6 +7,17 @@ from mpl_toolkits.mplot3d import Axes3D
 from matplotlib.widgets import CheckButtons
 import time
 
+#-----------------------------------------------------------
+#Goals:
+#   1. Train a NODE to match the Lorenz attractor
+#   2. Compare NODE's ability to match discrete and continuous versions of Lorenz
+#       - Generate a Euler step Lorenz approx
+#       - Solve the actual continuous ODE version of Lorenz and sample
+#       - Train one NODE on the continuous d/dt field
+#       - Train the other on the discrete finite-difference field
+#       - Compare performance
+#-----------------------------------------------------------
+
 device = 'mps' if torch.backends.mps.is_available() else 'cpu'
 torch.set_float32_matmul_precision('high')
 
@@ -45,14 +56,14 @@ start = time.time()
 for i in range(n_traj):
     if i > 0 and i % max(1, n_traj // 10) == 0:
         elapsed = time.time() - start
-        rate = i / elapsed
+        rate = i / max(elapsed, 1e-8)
         eta = (n_traj - i) / max(rate, 1e-8)
         print(f"[Gen:Continuous] {i}/{n_traj} done | {rate:.2f} traj/s | ETA {eta:.1f}s")
     traj_i = odeint(lorenz_ode, y0s[i], t, method='dopri5')
     true_trajs.append(traj_i)
 elapsed = time.time() - start
 print(f"[Gen:Continuous] Done {n_traj}/{n_traj} in {elapsed:.1f}s "
-      f"({n_traj/elapsed:.2f} traj/s)")
+      f"({n_traj/max(elapsed,1e-8):.2f} traj/s)")
 
 true_traj = torch.stack(true_trajs, dim=1)  # [T, n_traj, 3]
 dtrue = lorenz_vec(true_traj)               # [T, n_traj, 3]
@@ -81,7 +92,7 @@ for k in range(T):
         if device == "mps":
             torch.mps.synchronize()
         elapsed = time.time() - start
-        rate = k / elapsed
+        rate = k / max(elapsed, 1e-8)
         eta = (T - k) / max(rate, 1e-8)
         print(f"[Gen:Discrete] {k}/{T} steps | {rate:.1f} steps/s | ETA {eta:.1f}s")
     states = states + dt * lorenz_batch(states)
@@ -90,7 +101,7 @@ if device == "mps":
     torch.mps.synchronize()
 elapsed = time.time() - start
 print(f"[Gen:Discrete] Done {T}/{T} in {elapsed:.1f}s "
-      f"({T/elapsed:.1f} steps/s)")
+      f"({T/max(elapsed,1e-8):.1f} steps/s)")
 
 discrete_traj = torch.stack(all_traj, dim=0)  # [T, n_traj, 3]
 X_disc = discrete_traj[:-1].reshape(-1, 3)
@@ -110,12 +121,10 @@ mean_dy_disc, std_dy_disc = Ydot_disc.mean(0), Ydot_disc.std(0)
 Xd = (X_disc - mean_y_disc) / std_y_disc
 Yd = (Ydot_disc - mean_dy_disc) / std_dy_disc
 
-
 # Targets for the map: predict next *normalized* state directly
 Ynext_norm_disc = (Y_disc - mean_y_disc) / std_y_disc  # shape [N, 3]
-Xmap = Xd  # inputs already normalized: (X_disc - mean_y_disc) / std_y_disc
+Xmap = Xd  # inputs already normalized
 Ymap = Ynext_norm_disc
-
 
 #-------------------------------------------------------
 # ODE Model
@@ -132,14 +141,13 @@ class ODEFunc(nn.Module):
         return self.net(y)
 
 #-------------------------------------------------------
-# Train ODES
+# Train ODEs
 #-------------------------------------------------------
 def train_model(X, Y, label, epochs=3000, batch_size=1024):
     model = ODEFunc().to(device)
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-    X = X.to(device)
-    Y = Y.to(device)
+    X = X.to(device); Y = Y.to(device)
 
     tick = time.time()
     for epoch in range(epochs + 1):
@@ -155,13 +163,11 @@ def train_model(X, Y, label, epochs=3000, batch_size=1024):
         opt.step()
 
         if epoch % 100 == 0:
-            if device == "mps":
-                torch.mps.synchronize()
+            if device == "mps": torch.mps.synchronize()
             tock = time.time()
-            per100 = tock - tick
-            tick = time.time()
             print(f"[{label}] Epoch {epoch:4d} | Loss {loss.item():.6f} | "
-                  f"{per100:.3f} s / 100 epochs")
+                  f"{(tock - tick):.3f} s / 100 epochs")
+            tick = time.time()
     return model
 
 print("\n=== Training (continuous) ===")
@@ -170,10 +176,8 @@ f_cont = train_model(Xc, Yc, "Continuous", epochs=3000, batch_size=1024)
 print("\n=== Training (discrete) ===")
 f_disc = train_model(Xd, Yd, "Discrete", epochs=3000, batch_size=1024)
 
-
-
 #-------------------------------------------------------
-# Neural Iterative Map
+# Neural Iterative Map (x_{n+1} = f_map(x_n) on normalized states)
 #-------------------------------------------------------
 class MapNet(nn.Module):
     def __init__(self):
@@ -185,22 +189,17 @@ class MapNet(nn.Module):
         )
     def forward(self, x):  # x is normalized state at step n
         return self.net(x) # returns normalized state at step n+1
-    
 
-#-------------------------------------------------------
 # Train Neural Map on discrete pairs (x_n -> x_{n+1})
-#-------------------------------------------------------
 f_map = MapNet().to(device)
 opt_map = torch.optim.Adam(f_map.parameters(), lr=1e-3)
 
-Xmap = Xmap.to(device)
-Ymap = Ymap.to(device)
+Xmap = Xmap.to(device); Ymap = Ymap.to(device)
 
 batch_size = 1024
 epochs = 3000
-t0 = time.time()
-
-for epoch in range(epochs):
+tick = time.time()
+for epoch in range(epochs + 1):
     idx = torch.randint(0, Xmap.shape[0], (batch_size,), device=device)
     x_batch = Xmap[idx]       # normalized x_n
     y_next_true = Ymap[idx]   # normalized x_{n+1}
@@ -214,14 +213,17 @@ for epoch in range(epochs):
 
     if epoch % 100 == 0:
         if device == "mps": torch.mps.synchronize()
-        print(f"[Map] Epoch {epoch}, Loss = {loss.item():.6f}, "
-              f"{(time.time()-t0)/200:.4f} sec/100ep")
-        t0 = time.time()
+        tock = time.time()
+        print(f"[Map] Epoch {epoch:4d} | Loss {loss.item():.6f} | "
+              f"{(tock - tick):.3f} s / 100 epochs")
+        tick = time.time()
 
 #-------------------------------------------------------
-# Integrate learned systems from the SAME initial state
+# Integrate/iterate learned systems from the SAME initial state
 #-------------------------------------------------------
 y0_cpu = y0s[0].clone().cpu()
+
+# Normalize in the coordinate systems each model expects
 y0_norm_cont = (y0_cpu - mean_y_cont.cpu()) / std_y_cont.cpu()
 y0_norm_disc = (y0_cpu - mean_y_disc.cpu()) / std_y_disc.cpu()
 
@@ -229,16 +231,16 @@ t_test = t  # CPU
 f_cont_cpu = f_cont.to("cpu").eval()
 f_disc_cpu = f_disc.to("cpu").eval()
 
-# Rollout the map by iterating x_{n+1} = f_map(x_n) in normalized space
 with torch.no_grad():
-    f_map_cpu = f_map.to("cpu")
-    y_map = (y0_cpu - mean_y_disc.cpu()) / std_y_disc.cpu()  # normalized init (use discrete stats)
+    # Map rollout in normalized (discrete) space
+    f_map_cpu = f_map.to("cpu").eval()
+    y_map = (y0_cpu - mean_y_disc.cpu()) / std_y_disc.cpu()
     traj_list = [y_map.unsqueeze(0)]
     for _ in range(T-1):
         y_map = f_map_cpu(y_map)
         traj_list.append(y_map.unsqueeze(0))
-    pred_map = torch.cat(traj_list, dim=0)  # [T, 3] normalized
-    pred_map = pred_map * std_y_disc.cpu() + mean_y_disc.cpu()  # denormalize
+    pred_map = torch.cat(traj_list, dim=0)                         # [T, 3] normalized
+    pred_map = pred_map * std_y_disc.cpu() + mean_y_disc.cpu()     # denormalize
 
 with torch.no_grad():
     pred_cont = odeint(f_cont_cpu, y0_norm_cont, t_test, method='dopri5')
@@ -246,10 +248,7 @@ with torch.no_grad():
     pred_cont = pred_cont * std_y_cont.cpu() + mean_y_cont.cpu()
     pred_disc = pred_disc * std_y_disc.cpu() + mean_y_disc.cpu()
 
-
-# True single trajectory for the same seed index (0)
-# (It won’t correspond exactly to y0_cpu unless y0s[0] is the one used in that slot,
-# but good enough for visual comparison. If you want exact, regenerate that specific one.)
+# Ground truth trajectory from same y0
 true_traj_single = odeint(lorenz_ode, y0_cpu, t_test, method='dopri5')
 
 #-------------------------------------------------------
@@ -258,59 +257,63 @@ true_traj_single = odeint(lorenz_ode, y0_cpu, t_test, method='dopri5')
 true_np = true_traj_single.numpy()
 cont_np = pred_cont.numpy()
 disc_np = pred_disc.numpy()
+map_np  = pred_map.numpy()
 
 mse_cont = np.mean((true_np - cont_np) ** 2)
 mse_disc = np.mean((true_np - disc_np) ** 2)
-print(f"\n[TEST] Position MSE | Continuous: {mse_cont:.6f} | Discrete: {mse_disc:.6f}")
+mse_map  = np.mean((true_np - map_np)  ** 2)
+print(f"\n[TEST] Position MSE | Continuous: {mse_cont:.6f} | Discrete: {mse_disc:.6f} | Map: {mse_map:.6f}")
 
 #-------------------------------------------------------
-# Speeds over time for the three curves
+# Speeds over time for the four curves
 #-------------------------------------------------------
 def speeds_from_traj(arr, dt):
-    # arr: [T, 3]
     vel = np.diff(arr, axis=0) / dt
     spd = np.linalg.norm(vel, axis=1)
-    # pad to length T with last value for nicer plotting
     return np.concatenate([spd, spd[-1:]], axis=0)
 
 speed_true = speeds_from_traj(true_np, dt)
 speed_cont = speeds_from_traj(cont_np, dt)
 speed_disc = speeds_from_traj(disc_np, dt)
+speed_map  = speeds_from_traj(map_np,  dt)
 tt = t_test.numpy()
 
 #-------------------------------------------------------
-# Visualization: 3 panels + toggles
+# Visualization: 3 panels + toggles (now includes Map)
 #-------------------------------------------------------
 fig = plt.figure(figsize=(13, 8))
 
 # 3D Trajectory
 ax3d = fig.add_subplot(2, 2, 1, projection='3d')
-true_3d, = ax3d.plot(true_np[:, 0], true_np[:, 1], true_np[:, 2], color='blue', lw=0.7, label='True Lorenz')
-cont_3d, = ax3d.plot(cont_np[:, 0], cont_np[:, 1], cont_np[:, 2], color='green', lw=0.7, label='Neural ODE (Continuous)')
-disc_3d, = ax3d.plot(disc_np[:, 0], disc_np[:, 1], disc_np[:, 2], color='orange', lw=0.7, label='Neural ODE (Discrete)')
-map_line, = ax3d.plot(pred_map[:, 0], pred_map[:, 1], pred_map[:, 2], color='purple', lw=0.7, label='Neural Map (Discrete)')
+true_3d, = ax3d.plot(true_np[:, 0], true_np[:, 1], true_np[:, 2], lw=0.7, label='True Lorenz')
+cont_3d, = ax3d.plot(cont_np[:, 0], cont_np[:, 1], cont_np[:, 2], lw=0.7, label='Neural ODE (Continuous)')
+disc_3d, = ax3d.plot(disc_np[:, 0], disc_np[:, 1], disc_np[:, 2], lw=0.7, label='Neural ODE (Discrete)')
+map_3d,  = ax3d.plot(map_np[:,  0], map_np[:,  1], map_np[:,  2],  lw=0.7, label='Neural Map (Discrete)')
 ax3d.set_title("3D Trajectories")
 
 # 2D x–z projection
 ax2d = fig.add_subplot(2, 2, 2)
-true_2d, = ax2d.plot(true_np[:, 0], true_np[:, 2], color='blue', lw=0.7, label='True Lorenz')
-cont_2d, = ax2d.plot(cont_np[:, 0], cont_np[:, 2], color='green', lw=0.7, label='Neural ODE (Continuous)')
-disc_2d, = ax2d.plot(disc_np[:, 0], disc_np[:, 2], color='orange', lw=0.7, label='Neural ODE (Discrete)')
+true_2d, = ax2d.plot(true_np[:, 0], true_np[:, 2], lw=0.7, label='True Lorenz')
+cont_2d, = ax2d.plot(cont_np[:, 0], cont_np[:, 2], lw=0.7, label='Neural ODE (Continuous)')
+disc_2d, = ax2d.plot(disc_np[:, 0], disc_np[:, 2], lw=0.7, label='Neural ODE (Discrete)')
+# FIX: map in 2D should be (x, z), not (x, y, z)
+map_2d,  = ax2d.plot(map_np[:,  0], map_np[:,  2],  lw=0.7, label='Neural Map (Discrete)')
 ax2d.set_xlabel('x'); ax2d.set_ylabel('z'); ax2d.set_title('x–z Projection')
 
 # Speed vs time
 axspd = fig.add_subplot(2, 1, 2)
-true_spd_line, = axspd.plot(tt, speed_true, color='blue', lw=0.9, label='True speed')
-cont_spd_line, = axspd.plot(tt, speed_cont, color='green', lw=0.9, label='Continuous speed')
-disc_spd_line, = axspd.plot(tt, speed_disc, color='orange', lw=0.9, label='Discrete speed')
+true_spd_line, = axspd.plot(tt, speed_true, lw=0.9, label='True speed')
+cont_spd_line, = axspd.plot(tt, speed_cont, lw=0.9, label='Continuous speed')
+disc_spd_line, = axspd.plot(tt, speed_disc, lw=0.9, label='Discrete speed')
+map_spd_line,  = axspd.plot(tt, speed_map,  lw=0.9, label='Neural Map speed')
 axspd.set_xlabel('time'); axspd.set_ylabel('speed'); axspd.set_title('Speed vs Time')
 axspd.legend(loc='upper right')
 
-# Shared legend + checkboxes
-handles = [true_3d, cont_3d, disc_3d]
-labels = ['True Lorenz', 'Continuous', 'Discrete']
+# Shared legend + checkboxes (now includes Map)
+handles = [true_3d, cont_3d, disc_3d, map_3d]
+labels  = ['True Lorenz', 'Continuous', 'Discrete', 'Map']
 
-rax = plt.axes([0.015, 0.45, 0.15, 0.15])
+rax = plt.axes([0.015, 0.42, 0.16, 0.20])
 check = CheckButtons(rax, labels, [h.get_visible() for h in handles])
 
 def set_visible(line_list, visible):
@@ -321,11 +324,11 @@ def set_visible(line_list, visible):
 lines_map = {
     'True Lorenz': [true_3d, true_2d, true_spd_line],
     'Continuous':  [cont_3d, cont_2d, cont_spd_line],
-    'Discrete':    [disc_3d, disc_2d, disc_spd_line]
+    'Discrete':    [disc_3d, disc_2d, disc_spd_line],
+    'Map':         [map_3d,  map_2d,  map_spd_line],
 }
 
 def on_check(label):
-    # Toggle visibility in every panel
     target_lines = lines_map[label]
     new_visible = not target_lines[0].get_visible()
     set_visible(target_lines, new_visible)
@@ -333,5 +336,22 @@ def on_check(label):
 
 check.on_clicked(on_check)
 
-plt.tight_layout(rect=[0.18, 0.05, 1, 0.98])
+
+#-------------------------------------------------------
+# Add 4th subplot: per-step RMS state error
+#-------------------------------------------------------
+axerr = fig.add_subplot(2, 2, 4)
+err_cont = np.sqrt(np.mean((true_np - cont_np) ** 2, axis=1))
+err_disc = np.sqrt(np.mean((true_np - disc_np) ** 2, axis=1))
+err_map  = np.sqrt(np.mean((true_np - map_np)  ** 2, axis=1))
+
+axerr.plot(tt, err_cont, color='green', lw=0.9, label='Continuous error')
+axerr.plot(tt, err_disc, color='orange', lw=0.9, label='Discrete error')
+axerr.plot(tt, err_map,  color='purple', lw=0.9, label='Map error')
+axerr.set_xlabel('time'); axerr.set_ylabel('RMS state error')
+axerr.set_title('Divergence Over Time')
+axerr.legend(loc='upper left')
+
+# Adjust layout to fit 4 panels
+plt.tight_layout(rect=[0.19, 0.05, 1, 0.98])
 plt.show()
